@@ -26,18 +26,30 @@ fn verify_adapter_name(adapter_name: &str) -> Result<(), String> {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `std::env::temp_dir()` panics inside a WASI component, so resolve the
+/// directory ourselves and fall back to a platform default.
+fn proxy_script_path() -> std::path::PathBuf {
+    let (os, _) = zed::current_platform();
+    let dir = match os {
+        zed::Os::Windows => std::env::var("TEMP")
+            .or_else(|_| std::env::var("TMP"))
+            .or_else(|_| {
+                std::env::var("USERPROFILE").map(|home| format!("{home}\\AppData\\Local\\Temp"))
+            })
+            .unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
+        _ => std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string()),
+    };
+
+    std::path::PathBuf::from(dir).join(DAP_PROXY_FILE)
+}
+
 /// Writes the embedded proxy to a temporary file and returns the Node command
 /// that Zed should spawn.
 fn node_proxy_command(probe_rs: &str, port: u16) -> Result<(String, Vec<String>), String> {
     let node = zed::node_binary_path()
         .map_err(|err| format!("Zed's bundled Node.js is unavailable: {err}"))?;
 
-    let mut script_path = std::env::temp_dir();
-    if script_path.as_os_str().is_empty() {
-        script_path.push("/tmp");
-    }
-    script_path.push(DAP_PROXY_FILE);
-    let script_path = script_path.to_string_lossy().into_owned();
+    let script_path = proxy_script_path().to_string_lossy().into_owned();
 
     let output = zed::process::Command::new(&node)
         .args(["-e", NODE_WRITE_SCRIPT, script_path.as_str(), DAP_PROXY_JS])
