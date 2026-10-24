@@ -1,10 +1,22 @@
 id = "probe-rs"
 name = "probe-rs"
-version = "0.0.1"
+version = "0.1.0"
 schema_version = 1
-authors = ["Dominik Böhi <dboehi@fastmail.com>"]
+authors = [
+    "WangWindow <1598593280@qq.com>",
+    "Dominik Böhi <dboehi@fastmail.com>",
+]
 description = "Debugger for embedded systems using probe-rs"
-repository = "https://github.com/probe-rs/zed-extension"
+repository = "https://github.com/WangWindow/zed-extension-probe-rs"
+
+[lib]
+kind = "Rust"
+version = "0.6.0"
+
+[[capabilities]]
+kind = "process:exec"
+command = "*"
+args = ["**"]
 
 [debug_adapters.probe-rs]
 # Schema is taken from the default location in debug_adapter_schemas/probe-rs.json

@@ -2,11 +2,17 @@ use std::{net::Ipv4Addr, time::Duration};
 
 use zed_extension_api::{
     self as zed, DebugAdapterBinary, DebugConfig, DebugRequest, DebugScenario, DebugTaskDefinition,
-    StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest, TcpArguments, Worktree,
-    serde_json,
+    StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest, TcpArguments,
+    TcpArgumentsTemplate, Worktree, serde_json,
 };
 
 const ADAPTER_NAME: &str = "probe-rs";
+
+/// DAP proxy that runs on Zed's bundled Node.js. Kept in the extension crate so
+/// no external helper binary has to be installed or configured.
+const DAP_PROXY_JS: &str = include_str!("../proxy/dap_proxy.js");
+const DAP_PROXY_FILE: &str = "zed-probe-rs-dap-proxy.js";
+const NODE_WRITE_SCRIPT: &str = "require('fs').writeFileSync(process.argv[1], process.argv[2])";
 
 fn verify_adapter_name(adapter_name: &str) -> Result<(), String> {
     if adapter_name != ADAPTER_NAME {
@@ -19,6 +25,43 @@ fn verify_adapter_name(adapter_name: &str) -> Result<(), String> {
 }
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Writes the embedded proxy to a temporary file and returns the Node command
+/// that Zed should spawn.
+fn node_proxy_command(probe_rs: &str, port: u16) -> Result<(String, Vec<String>), String> {
+    let node = zed::node_binary_path()
+        .map_err(|err| format!("Zed's bundled Node.js is unavailable: {err}"))?;
+
+    let mut script_path = std::env::temp_dir();
+    if script_path.as_os_str().is_empty() {
+        script_path.push("/tmp");
+    }
+    script_path.push(DAP_PROXY_FILE);
+    let script_path = script_path.to_string_lossy().into_owned();
+
+    let output = zed::process::Command::new(&node)
+        .args(["-e", NODE_WRITE_SCRIPT, script_path.as_str(), DAP_PROXY_JS])
+        .output()
+        .map_err(|err| format!("failed to write the embedded DAP proxy: {err}"))?;
+
+    if output.status != Some(0) {
+        return Err(format!(
+            "failed to write the embedded DAP proxy: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok((
+        node,
+        vec![
+            script_path,
+            "--port".to_string(),
+            port.to_string(),
+            "--upstream".to_string(),
+            probe_rs.to_string(),
+        ],
+    ))
+}
 
 struct ProbeRsDebugger {
     // ... state
@@ -38,79 +81,97 @@ impl zed::Extension for ProbeRsDebugger {
         adapter_name: String,
         config: DebugTaskDefinition,
         user_provided_debug_adapter_path: Option<String>,
-        _worktree: &Worktree,
+        worktree: &Worktree,
     ) -> Result<DebugAdapterBinary, String> {
-        // TODO: Handle task definition
-
         verify_adapter_name(&adapter_name)?;
-
-        // TODO: Can this be none if we want to use an already running instance of probe-rs?
-        //let command =
-        //    Some(user_provided_debug_adapter_path.unwrap_or_else(|| "probe-rs".to_string()));
 
         let json_config: serde_json::Value = serde_json::from_str(&config.config)
             .map_err(|err| format!("Failed to parse JSON config: {}", err))?;
 
-        // TODO: Figure out the interaction with `DebugTaskDefinition.tcp_connection`.
-        //
-        // The use of the server field here is taken from the vscode plugin.
-        let received_connection =
-            if let Some(server_string) = json_config.get("server").and_then(|s| s.as_str()) {
-                let mut parsed = parse_server_string(server_string)?;
-
-                // See <https://github.com/zed-industries/zed/blob/834cdc127176228c3c11f1d2cf68a90797a54f15/crates/dap/src/transport.rs#L577>,
-                // this seems to be in milliseconds
-                parsed.timeout = Some(DEFAULT_TIMEOUT.as_millis() as u64);
-
-                Some(parsed)
-            } else {
-                None
-            };
-
-        // TODO: Consider downloading the debug adapter if it's not found.
-        let mut command = None;
-        let mut arguments = Vec::new();
-
-        let connection = if received_connection.is_none() {
-            command =
-                Some(user_provided_debug_adapter_path.unwrap_or_else(|| "probe-rs".to_string()));
-
-            // TOOD: Get a port from somewhere
-            let port = 50_000;
-
-            let tcp_arguments = TcpArguments {
-                port,
-                host: Ipv4Addr::LOCALHOST.to_bits(),
-                timeout: Some(DEFAULT_TIMEOUT.as_millis() as u64),
-            };
-
-            arguments.extend_from_slice(&[
-                "dap-server".to_string(),
-                "--port".to_string(),
-                port.to_string(),
-            ]);
-
-            Some(tcp_arguments)
-        } else {
-            received_connection
+        // Keep the "start debugging" request kind in sync with the scenario.
+        let request = match json_config.get("request").and_then(|value| value.as_str()) {
+            Some("attach") => StartDebuggingRequestArgumentsRequest::Attach,
+            _ => StartDebuggingRequestArgumentsRequest::Launch,
         };
 
-        println!("Configuration for DAP: {}", config.config);
+        // An explicit `server` field means: connect to an already running
+        // `probe-rs dap-server` instead of spawning one.
+        if let Some(server_string) = json_config.get("server").and_then(|value| value.as_str()) {
+            let mut connection = parse_server_string(server_string)?;
+            // This timeout is in milliseconds.
+            connection.timeout = Some(DEFAULT_TIMEOUT.as_millis() as u64);
 
-        // TODO: What happens if both command and tcp connection are provided?
+            return Ok(DebugAdapterBinary {
+                command: None,
+                arguments: Vec::new(),
+                envs: Vec::new(),
+                cwd: None,
+                connection: Some(connection),
+                request_args: StartDebuggingRequestArguments {
+                    configuration: config.config,
+                    request,
+                },
+            });
+        }
 
-        Ok(DebugAdapterBinary {
-            command,
-            arguments,
-            envs: vec![],
-            cwd: None,
-            connection,
-            request_args: StartDebuggingRequestArguments {
-                // We just pass along the configuration
-                configuration: config.config,
-                request: StartDebuggingRequestArgumentsRequest::Launch,
-            },
+        // `dap.probe-rs.binary` overrides the probe-rs binary itself; the DAP
+        // proxy is always provided by this extension.
+        let probe_rs = user_provided_debug_adapter_path
+            .or_else(|| worktree.which("probe-rs"))
+            .unwrap_or_else(|| "probe-rs".to_string());
+
+        // Let Zed allocate a free loopback port. The upstream extension
+        // hardcoded 50000, which left stale dap-server processes behind and
+        // made a second debug session fail to bind.
+        let connection = zed::resolve_tcp_template(TcpArgumentsTemplate {
+            port: None,
+            host: Some(Ipv4Addr::LOCALHOST.to_bits()),
+            timeout: Some(DEFAULT_TIMEOUT.as_millis() as u64),
         })
+        .map_err(|err| format!("Failed to allocate a TCP port for the DAP session: {err}"))?;
+
+        // Prefer the embedded proxy: it performs the RTT handshake and turns
+        // RTT data into standard DAP output events. If Zed's Node runtime is
+        // unavailable, fall back to probe-rs directly (debugging still works,
+        // but RTT logs do not).
+        println!(
+            "probe-rs extension: embedded DAP proxy for {probe_rs} on 127.0.0.1:{}",
+            connection.port
+        );
+        match node_proxy_command(&probe_rs, connection.port) {
+            Ok((node, arguments)) => Ok(DebugAdapterBinary {
+                command: Some(node),
+                arguments,
+                envs: Vec::new(),
+                cwd: None,
+                connection: Some(connection),
+                request_args: StartDebuggingRequestArguments {
+                    configuration: config.config,
+                    request,
+                },
+            }),
+            Err(error) => {
+                eprintln!("probe-rs extension: {error}; RTT logs will be unavailable");
+                Ok(DebugAdapterBinary {
+                    command: Some(probe_rs),
+                    arguments: vec![
+                        "dap-server".to_string(),
+                        "--port".to_string(),
+                        connection.port.to_string(),
+                        // Probe-rs otherwise keeps listening after the client
+                        // disconnects, holding both the TCP port and the USB probe.
+                        "--single-session".to_string(),
+                    ],
+                    envs: Vec::new(),
+                    cwd: None,
+                    connection: Some(connection),
+                    request_args: StartDebuggingRequestArguments {
+                        configuration: config.config,
+                        request,
+                    },
+                })
+            }
+        }
     }
 
     fn dap_request_kind(
@@ -196,6 +257,9 @@ impl zed::Extension for ProbeRsDebugger {
 }
 
 fn parse_server_string(server_string: &str) -> Result<TcpArguments, String> {
+    // The README used to contain a trailing space in the example, which made
+    // the old parser reject an otherwise valid value.
+    let server_string = server_string.trim();
     let parts: Vec<&str> = server_string.split(':').collect();
 
     if parts.len() != 2 {
@@ -208,15 +272,17 @@ fn parse_server_string(server_string: &str) -> Result<TcpArguments, String> {
     let host_str = parts[0];
     let port_str = parts[1];
 
-    // Parse the host IP address
-    let host_ip: Ipv4Addr = host_str.parse().map_err(|_| {
-        format!(
-            "Invalid IP address '{}'. Expected a valid IPv4 address",
-            host_str
-        )
-    })?;
+    let host_ip: Ipv4Addr = if host_str.eq_ignore_ascii_case("localhost") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        host_str.parse().map_err(|_| {
+            format!(
+                "Invalid IP address '{}'. Expected a valid IPv4 address",
+                host_str
+            )
+        })?
+    };
 
-    // Parse the port number
     let port: u16 = port_str.parse().map_err(|_| {
         format!(
             "Invalid port number '{}'. Expected a number between 0 and 65535",
@@ -294,6 +360,13 @@ mod test {
         let result = super::parse_server_string("127.0.0.1:");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid port number"));
+    }
+
+    #[test]
+    fn parse_server_string_trims_and_accepts_localhost() {
+        let result = super::parse_server_string(" localhost:50000 ").unwrap();
+        assert_eq!(result.host, Ipv4Addr::LOCALHOST.to_bits());
+        assert_eq!(result.port, 50000);
     }
 
     #[test]
