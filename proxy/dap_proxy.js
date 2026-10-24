@@ -50,7 +50,8 @@ class FrameReader {
     this.buffer = Buffer.alloc(0);
 
     stream.on("data", (chunk) => {
-      this.buffer = Buffer.concat([this.buffer, chunk]);
+      this.buffer =
+        this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
       this.parse();
     });
     stream.on("error", (error) => this.fail(error));
@@ -99,6 +100,9 @@ class FrameReader {
 }
 
 const server = net.createServer((client) => {
+  // DAP frames are small; Nagle would add up to ~40 ms to RTT output.
+  client.setNoDelay(true);
+
   const child = spawn(upstream, ["dap-server"], {
     stdio: ["pipe", "pipe", "inherit"],
   });
@@ -107,6 +111,25 @@ const server = net.createServer((client) => {
   const openedChannels = new Set();
   let proxySeq = PROXY_SEQ_BASE;
   let closed = false;
+
+  // Coalesce all RTT chunks parsed in the same event-loop turn into one DAP
+  // output event. This keeps the console responsive under bursts without
+  // adding measurable latency (setImmediate runs before the next poll).
+  let pendingRtt = "";
+  let rttFlushScheduled = false;
+
+  const flushRtt = () => {
+    rttFlushScheduled = false;
+    if (!pendingRtt) return;
+    const text = pendingRtt;
+    pendingRtt = "";
+    sendToClient({
+      seq: 0,
+      type: "event",
+      event: "output",
+      body: { category: "console", output: text },
+    });
+  };
 
   const sendToChild = (message) => {
     if (child.stdin.writable) child.stdin.write(frame(message));
@@ -175,12 +198,11 @@ const server = net.createServer((client) => {
             let text = message.body?.data ?? "";
             if (channel !== 0) text = `[RTT ch${channel}] ${text}`;
             if (!text.endsWith("\n")) text += "\n";
-            sendToClient({
-              seq: 0,
-              type: "event",
-              event: "output",
-              body: { category: "stdout", output: text },
-            });
+            pendingRtt += text;
+            if (!rttFlushScheduled) {
+              rttFlushScheduled = true;
+              setImmediate(flushRtt);
+            }
             return;
           }
 
