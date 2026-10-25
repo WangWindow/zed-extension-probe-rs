@@ -14,8 +14,15 @@ chip probe-rs supports (STM32, ESP32, nRF, RP2040, ...).
     "adapter": "probe-rs",
     "request": "launch",
     "cwd": "$ZED_WORKTREE_ROOT",
-    "server": "127.0.0.1:50000  ",
-    "coreConfigs": []
+    "chip": "<chip-name-from-probe-rs-chip-list>",
+    "flashingConfig": { "flashingEnabled": true },
+    "coreConfigs": [
+      {
+        "coreIndex": 0,
+        "programBinary": "<path-to-firmware.elf>",
+        "rttEnabled": true
+      }
+    ]
   }
 ]
 ```
@@ -23,19 +30,12 @@ chip probe-rs supports (STM32, ESP32, nRF, RP2040, ...).
 Find the chip name with `probe-rs chip list`. Remaining options match the
 [probe-rs debugger docs](https://probe.rs/docs/tools/debugger/).
 
-The extension starts a DAP proxy on a free loopback port and spawns
-`probe-rs dap-server` over stdin/stdout (no hardcoded port, `--single-session`).
-To use an existing server instead, set `"server": "127.0.0.1:50000"`.
-
 ## RTT / defmt
 
 Zed does not answer probe-rs' `probe-rs-rtt-channel-config` event, so probe-rs
 never forwards RTT data. The extension embeds `proxy/dap_proxy.js`, runs it with
 Zed's bundled Node.js, performs the `rttWindowOpened` handshake, and converts
 `probe-rs-rtt-data` into standard DAP `output` events.
-
-No external helper binary is needed. RTT logs appear directly in Zed's Debug
-Console.
 
 ## Development
 
